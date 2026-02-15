@@ -23,10 +23,10 @@
 #define DELAY_MIN 85
 #define DELAY_MAX 120
 
-// CS2 Model detection thresholds (IndexCount for player models)
+// CS2 Model detection thresholds
 #define PLAYER_MODEL_INDEX_COUNT_MIN 10000
 #define PLAYER_MODEL_INDEX_COUNT_MAX 15000
-#define PLAYER_MODEL_STRIDE 40  // Typical stride for player vertex data
+#define PLAYER_MODEL_STRIDE 40
 
 // ==================== Offsets (Latest CS2) ====================
 namespace Offsets {
@@ -40,9 +40,11 @@ namespace Offsets {
 
 // ==================== Types ====================
 typedef HRESULT(__stdcall* Present_t)(IDXGISwapChain*, UINT, UINT);
+typedef HRESULT(__stdcall* ResizeBuffers_t)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 typedef void(__stdcall* DrawIndexed_t)(ID3D11DeviceContext*, UINT, UINT, INT);
 
 Present_t g_originalPresent = nullptr;
+ResizeBuffers_t g_originalResizeBuffers = nullptr;
 DrawIndexed_t g_originalDrawIndexed = nullptr;
 
 // ==================== COM Helper ====================
@@ -66,8 +68,6 @@ bool g_hookInitialized = false;
 ID3D11Device* g_device = nullptr;
 ID3D11DeviceContext* g_context = nullptr;
 ID3D11RenderTargetView* g_renderTargetView = nullptr;
-ID3D11RasterizerState* g_savedRasterizerState = nullptr;
-ID3D11BlendState* g_savedBlendState = nullptr;
 
 // Module bases
 HMODULE g_clientDll = nullptr;
@@ -88,15 +88,13 @@ struct EnemyData {
     int health;
     int teamNum;
     bool visible;
-    int drawCallId;  // To track which draw call rendered this
 };
 
 std::vector<EnemyData> g_detectedEnemies;
 std::mutex g_enemyDataMutex;
 
-// ESP vertex buffer and index buffer
+// ESP vertex buffer
 ID3D11Buffer* g_espVertexBuffer = nullptr;
-ID3D11Buffer* g_espIndexBuffer = nullptr;
 const int MAX_ESP_VERTICES = 5000;
 
 // RNG for delays
@@ -116,21 +114,18 @@ TriggerState g_triggerState = IDLE;
 DWORD g_fireTime = 0;
 DWORD g_lastShotTime = 0;
 int g_currentDelay = 0;
-int g_localPlayerTeam = 3;  // 2=Terrorist, 3=Counter-Terrorist
-
-// DrawIndexed tracking
-int g_currentDrawCallId = 0;
+int g_localPlayerTeam = 3;
 
 // ==================== Utility Functions ====================
 
 void Log(const char* fmt, ...) {
-#if ENABLE_CONSOLE
+    #if ENABLE_CONSOLE
     va_list args;
     va_start(args, fmt);
     vprintf(fmt, args);
     va_end(args);
     printf("\n");
-#endif
+    #endif
 }
 
 HMODULE GetModuleBaseAddress(const char* moduleName) {
@@ -143,15 +138,13 @@ void UpdateViewMatrix() {
     if (!g_clientDll) return;
 
     std::lock_guard<std::mutex> lock(g_viewMatrixMutex);
-
+    
     uintptr_t clientBase = (uintptr_t)g_clientDll;
     float* viewMatrixAddr = (float*)(clientBase + Offsets::client_dll::dwViewMatrix);
-
-    // Safe memcpy with mutex protection
+    
     try {
         memcpy(g_viewMatrix, viewMatrixAddr, sizeof(float) * 16);
-    }
-    catch (...) {
+    } catch (...) {
         Log("[-] Error reading viewMatrix");
     }
 }
@@ -167,67 +160,49 @@ float* GetViewMatrix() {
 
 bool WorldToScreen(float* viewMatrix, float x, float y, float z, float& screenX, float& screenY) {
     float w = viewMatrix[12] * x + viewMatrix[13] * y + viewMatrix[14] * z + viewMatrix[15];
-
+    
     if (w < 0.01f) return false;
-
+    
     float invW = 1.0f / w;
-
-    screenX = (float)SCREEN_WIDTH / 2.0f +
-        (viewMatrix[0] * x + viewMatrix[1] * y + viewMatrix[2] * z + viewMatrix[3]) *
-        invW * (float)SCREEN_WIDTH / 2.0f;
-
-    screenY = (float)SCREEN_HEIGHT / 2.0f -
-        (viewMatrix[4] * x + viewMatrix[5] * y + viewMatrix[6] * z + viewMatrix[7]) *
-        invW * (float)SCREEN_HEIGHT / 2.0f;
-
-    // Frustum culling
-    return screenX > -100 && screenX < SCREEN_WIDTH + 100 &&
-        screenY > -100 && screenY < SCREEN_HEIGHT + 100;
+    
+    screenX = (float)SCREEN_WIDTH / 2.0f + 
+              (viewMatrix[0] * x + viewMatrix[1] * y + viewMatrix[2] * z + viewMatrix[3]) * 
+              invW * (float)SCREEN_WIDTH / 2.0f;
+    
+    screenY = (float)SCREEN_HEIGHT / 2.0f - 
+              (viewMatrix[4] * x + viewMatrix[5] * y + viewMatrix[6] * z + viewMatrix[7]) * 
+              invW * (float)SCREEN_HEIGHT / 2.0f;
+    
+    return screenX > -100 && screenX < SCREEN_WIDTH + 100 && 
+           screenY > -100 && screenY < SCREEN_HEIGHT + 100;
 }
 
-// ==================== ESP Rendering with Index Buffer ====================
+// ==================== ESP Rendering ====================
 
 void CreateESPBuffers() {
+    if (!g_device) return;
+
     // Create vertex buffer
     D3D11_BUFFER_DESC vbd = {};
     vbd.Usage = D3D11_USAGE_DYNAMIC;
     vbd.ByteWidth = sizeof(ESPVertex) * MAX_ESP_VERTICES;
     vbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
     vbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-
+    
     if (FAILED(g_device->CreateBuffer(&vbd, nullptr, &g_espVertexBuffer))) {
         Log("[-] Failed to create ESP vertex buffer");
-        return;
+    } else {
+        Log("[+] ESP vertex buffer created");
     }
-
-    // Create index buffer
-    std::vector<unsigned short> indices;
-
-    // Generate indices for line list (12 lines per box = 24 indices)
-    // For now, pre-allocate space
-    indices.reserve(MAX_ESP_VERTICES);
-
-    D3D11_BUFFER_DESC ibd = {};
-    ibd.Usage = D3D11_USAGE_DYNAMIC;
-    ibd.ByteWidth = sizeof(unsigned short) * MAX_ESP_VERTICES;
-    ibd.BindFlags = D3D11_BIND_INDEX_BUFFER;
-    ibd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-
-    if (FAILED(g_device->CreateBuffer(&ibd, nullptr, &g_espIndexBuffer))) {
-        Log("[-] Failed to create ESP index buffer");
-        return;
-    }
-
-    Log("[+] ESP buffers created successfully");
 }
 
 void DrawESPBoxes() {
-    if (!g_espVertexBuffer || !g_espIndexBuffer || !g_context) {
+    if (!g_espVertexBuffer || !g_context) {
         return;
     }
 
     std::lock_guard<std::mutex> lock(g_enemyDataMutex);
-
+    
     if (g_detectedEnemies.empty()) {
         return;
     }
@@ -235,18 +210,19 @@ void DrawESPBoxes() {
     // Save render state
     ID3D11RasterizerState* oldRasterizer = nullptr;
     g_context->RSGetState(&oldRasterizer);
-
-    float blendFactor[4] = { 1, 1, 1, 1 };
+    
+    float blendFactor[4] = {1, 1, 1, 1};
     UINT sampleMask = 0xffffffff;
     ID3D11BlendState* oldBlend = nullptr;
     g_context->OMGetBlendState(&oldBlend, blendFactor, &sampleMask);
 
-    // Setup rendering
+    // Setup rasterizer state
     D3D11_RASTERIZER_DESC rastDesc = {};
     rastDesc.FillMode = D3D11_FILL_SOLID;
     rastDesc.CullMode = D3D11_CULL_NONE;
     rastDesc.DepthClipEnable = FALSE;
-
+    rastDesc.AntialiasedLineEnable = TRUE;
+    
     ComPtr<ID3D11RasterizerState> rasterizer;
     if (SUCCEEDED(g_device->CreateRasterizerState(&rastDesc, &rasterizer))) {
         g_context->RSSetState(rasterizer.get());
@@ -273,32 +249,32 @@ void DrawESPBoxes() {
         // Color: Red for enemy, Green for friendly
         unsigned int color = (enemy.teamNum != g_localPlayerTeam) ? 0xFF0000FF : 0xFF00FF00;
 
-        // Box outline vertices (8 vertices for 4 lines when using line list)
+        // Box outline (8 vertices for 4 lines with LINELIST)
         if (vertexCount + 8 <= MAX_ESP_VERTICES) {
-            // Top-left to top-right
-            vertices[vertexCount++] = { left, top, 0.5f, color };
-            vertices[vertexCount++] = { right, top, 0.5f, color };
+            // Top horizontal line
+            vertices[vertexCount++] = {left, top, 0.5f, color};
+            vertices[vertexCount++] = {right, top, 0.5f, color};
 
-            // Top-right to bottom-right
-            vertices[vertexCount++] = { right, top, 0.5f, color };
-            vertices[vertexCount++] = { right, bottom, 0.5f, color };
+            // Right vertical line
+            vertices[vertexCount++] = {right, top, 0.5f, color};
+            vertices[vertexCount++] = {right, bottom, 0.5f, color};
 
-            // Bottom-right to bottom-left
-            vertices[vertexCount++] = { right, bottom, 0.5f, color };
-            vertices[vertexCount++] = { left, bottom, 0.5f, color };
+            // Bottom horizontal line
+            vertices[vertexCount++] = {right, bottom, 0.5f, color};
+            vertices[vertexCount++] = {left, bottom, 0.5f, color};
 
-            // Bottom-left to top-left
-            vertices[vertexCount++] = { left, bottom, 0.5f, color };
-            vertices[vertexCount++] = { left, top, 0.5f, color };
+            // Left vertical line
+            vertices[vertexCount++] = {left, bottom, 0.5f, color};
+            vertices[vertexCount++] = {left, top, 0.5f, color};
         }
 
-        // Health bar (vertical line on left)
+        // Health bar
         if (vertexCount + 2 <= MAX_ESP_VERTICES) {
-            float healthPercent = enemy.health / 100.0f;
-            float healthBarTop = top + (enemy.boxHeight * healthPercent);
-
-            vertices[vertexCount++] = { left - 5, top, 0.5f, 0xFF00FF00 };
-            vertices[vertexCount++] = { left - 5, healthBarTop, 0.5f, 0xFF00FF00 };
+            float healthPercent = std::max(0.0f, std::min(1.0f, enemy.health / 100.0f));
+            float healthBarTop = top + (enemy.boxHeight * (1.0f - healthPercent));
+            
+            vertices[vertexCount++] = {left - 8, top, 0.5f, 0xFF00FF00};
+            vertices[vertexCount++] = {left - 8, healthBarTop, 0.5f, 0xFF00FF00};
         }
     }
 
@@ -325,75 +301,59 @@ cleanup:
 // ==================== DrawIndexed Hook for Enemy Detection ====================
 
 void __stdcall HookedDrawIndexed(ID3D11DeviceContext* pThis, UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation) {
-    // Track draw call
-    int drawCallId = g_currentDrawCallId++;
-
-    // Detect player models by IndexCount and stride
+    // Detect player models
     if (IndexCount >= PLAYER_MODEL_INDEX_COUNT_MIN && IndexCount <= PLAYER_MODEL_INDEX_COUNT_MAX) {
-
-        // Get input layout to determine stride
-        ComPtr<ID3D11InputLayout> inputLayout;
-        pThis->IAGetInputLayout(&inputLayout);
-
-        if (inputLayout) {
-            // Extract vertex buffer info
-            ID3D11Buffer* vertexBuffer = nullptr;
-            UINT stride, offset;
-            pThis->IAGetVertexBuffers(0, 1, &vertexBuffer, &stride, &offset);
-
-            if (vertexBuffer && stride == PLAYER_MODEL_STRIDE) {
-                // This appears to be a player model
-
-                // Get world transformation matrix (from constant buffer)
-                ID3D11Buffer* constantBuffer = nullptr;
-                pThis->VSGetConstantBuffers(0, 1, &constantBuffer);
-
-                if (constantBuffer) {
-                    // Map and read world matrix from constant buffer slot 0
-                    D3D11_MAPPED_SUBRESOURCE mapped;
-                    if (SUCCEEDED(pThis->Map(constantBuffer, 0, D3D11_MAP_READ, 0, &mapped))) {
-                        float* worldMatrix = (float*)mapped.pData;
-
-                        // Extract position from world matrix (last row)
-                        float enemyX = worldMatrix[12];
-                        float enemyY = worldMatrix[13];
-                        float enemyZ = worldMatrix[14];
-
-                        pThis->Unmap(constantBuffer, 0);
-
-                        // Convert to screen space
-                        float* viewMatrix = GetViewMatrix();
-                        float screenX, screenY;
-
-                        if (WorldToScreen(viewMatrix, enemyX, enemyY, enemyZ, screenX, screenY)) {
-                            // Add to detected enemies
-                            std::lock_guard<std::mutex> lock(g_enemyDataMutex);
-
-                            if (g_detectedEnemies.size() < 20) {  // Limit to 20 enemies
-                                EnemyData enemy = {};
-                                enemy.screenX = screenX;
-                                enemy.screenY = screenY;
-                                enemy.boxWidth = 40;
-                                enemy.boxHeight = 80;
-                                enemy.health = 100;  // Simplified
-                                enemy.teamNum = 2;   // Default to enemy team
-                                enemy.visible = true;
-                                enemy.drawCallId = drawCallId;
-
-                                g_detectedEnemies.push_back(enemy);
-                            }
+        // Get vertex buffers using GetStreamSource
+        ID3D11Buffer* vertexBuffer = nullptr;
+        UINT stride, offset;
+        pThis->IAGetVertexBuffers(0, 1, &vertexBuffer, &stride, &offset);
+        
+        if (vertexBuffer && stride == PLAYER_MODEL_STRIDE) {
+            // Get vertex shader constant buffers (world matrix is typically in slot 0)
+            ID3D11Buffer* constantBuffer = nullptr;
+            pThis->VSGetConstantBuffers(0, 1, &constantBuffer);
+            
+            if (constantBuffer) {
+                D3D11_MAPPED_SUBRESOURCE mapped;
+                if (SUCCEEDED(pThis->Map(constantBuffer, 0, D3D11_MAP_READ, 0, &mapped))) {
+                    float* worldMatrix = (float*)mapped.pData;
+                    
+                    // Extract position from world matrix
+                    float enemyX = worldMatrix[12];
+                    float enemyY = worldMatrix[13];
+                    float enemyZ = worldMatrix[14];
+                    
+                    pThis->Unmap(constantBuffer, 0);
+                    
+                    // Convert to screen space
+                    float* viewMatrix = GetViewMatrix();
+                    float screenX, screenY;
+                    
+                    if (WorldToScreen(viewMatrix, enemyX, enemyY, enemyZ, screenX, screenY)) {
+                        std::lock_guard<std::mutex> lock(g_enemyDataMutex);
+                        
+                        if (g_detectedEnemies.size() < 20) {
+                            EnemyData enemy = {};
+                            enemy.screenX = screenX;
+                            enemy.screenY = screenY;
+                            enemy.boxWidth = 40;
+                            enemy.boxHeight = 80;
+                            enemy.health = 100;
+                            enemy.teamNum = 2;
+                            enemy.visible = true;
+                            
+                            g_detectedEnemies.push_back(enemy);
                         }
                     }
-
-                    constantBuffer->Release();
                 }
+                
+                constantBuffer->Release();
             }
-
-            if (vertexBuffer) vertexBuffer->Release();
+            
+            vertexBuffer->Release();
         }
     }
 
-    // Call original
     return g_originalDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 }
 
@@ -423,9 +383,8 @@ bool IsEnemyAtCrosshair() {
 
     for (auto& enemy : g_detectedEnemies) {
         if (!enemy.visible || enemy.health <= 0) continue;
-        if (enemy.teamNum == g_localPlayerTeam) continue;  // Skip friendly team
+        if (enemy.teamNum == g_localPlayerTeam) continue;
 
-        // Optimized: distance squared instead of sqrt
         float distX = enemy.screenX - centerX;
         float distY = enemy.screenY - centerY;
         float distSq = distX * distX + distY * distY;
@@ -443,35 +402,35 @@ void UpdateTriggerBot() {
     bool enemyAtCrosshair = IsEnemyAtCrosshair();
 
     switch (g_triggerState) {
-    case IDLE:
-        if (enemyAtCrosshair && keyPressed) {
-            g_triggerState = LOCKED;
-            g_currentDelay = g_delayDist(g_gen);
-            g_fireTime = currentTime + g_currentDelay;
-            Log("[*] Enemy locked! Firing in %dms", g_currentDelay);
-        }
-        break;
-
-    case LOCKED:
-        if (!keyPressed || !enemyAtCrosshair) {
-            g_triggerState = IDLE;
+        case IDLE:
+            if (enemyAtCrosshair && keyPressed) {
+                g_triggerState = LOCKED;
+                g_currentDelay = g_delayDist(g_gen);
+                g_fireTime = GetTickCount() + g_currentDelay;
+                Log("[*] Enemy locked! Firing in %dms", g_currentDelay);
+            }
             break;
-        }
-        if (currentTime >= g_fireTime) {
-            TriggerShot();
-            g_triggerState = COOLDOWN;
-            g_lastShotTime = currentTime;
-        }
-        break;
 
-    case COOLDOWN:
-        if (currentTime - g_lastShotTime >= SHOOT_COOLDOWN) {
+        case LOCKED:
+            if (!keyPressed || !enemyAtCrosshair) {
+                g_triggerState = IDLE;
+                break;
+            }
+            if (currentTime >= g_fireTime) {
+                TriggerShot();
+                g_triggerState = COOLDOWN;
+                g_lastShotTime = currentTime;
+            }
+            break;
+
+        case COOLDOWN:
+            if (currentTime - g_lastShotTime >= SHOOT_COOLDOWN) {
+                g_triggerState = IDLE;
+            }
+            break;
+
+        default:
             g_triggerState = IDLE;
-        }
-        break;
-
-    default:
-        g_triggerState = IDLE;
     }
 }
 
@@ -493,7 +452,7 @@ HRESULT __stdcall HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, U
         init = true;
     }
 
-    // Update viewMatrix from render thread
+    // Update viewMatrix
     UpdateViewMatrix();
 
     // Clear enemy list for fresh detection
@@ -502,18 +461,43 @@ HRESULT __stdcall HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, U
         g_detectedEnemies.clear();
     }
 
-    // Set render target
+    // Set render target and draw ESP
     if (g_renderTargetView && g_context) {
         g_context->OMSetRenderTargets(1, &g_renderTargetView, nullptr);
-
-        // Draw ESP
         DrawESPBoxes();
     }
 
-    // Update triggerbot logic
+    // Update triggerbot
     UpdateTriggerBot();
 
     return g_originalPresent(pSwapChain, SyncInterval, Flags);
+}
+
+// ==================== ResizeBuffers Hook ====================
+
+HRESULT __stdcall HookedResizeBuffers(IDXGISwapChain* pThis, UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT NewFormat, UINT SwapChainFlags) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    // Release render target before resize
+    if (g_renderTargetView) {
+        g_renderTargetView->Release();
+        g_renderTargetView = nullptr;
+    }
+
+    HRESULT hr = g_originalResizeBuffers(pThis, BufferCount, Width, Height, NewFormat, SwapChainFlags);
+
+    if (SUCCEEDED(hr)) {
+        // Recreate render target after resize
+        ComPtr<ID3D11Texture2D> backBuffer;
+        if (SUCCEEDED(pThis->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&backBuffer))) {
+            if (g_device) {
+                g_device->CreateRenderTargetView(backBuffer.get(), nullptr, &g_renderTargetView);
+            }
+        }
+        Log("[*] Resized successfully");
+    }
+
+    return hr;
 }
 
 // ==================== Hook Installation ====================
@@ -548,7 +532,7 @@ IDXGISwapChain* CreateDummySwapChain() {
     IDXGISwapChain* swapChain = nullptr;
 
     D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_0 };
-
+    
     HRESULT hr = D3D11CreateDeviceAndSwapChain(
         nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
         featureLevels, 1, D3D11_SDK_VERSION,
@@ -578,23 +562,22 @@ bool InstallHooks() {
         return false;
     }
 
-    // Get Present address (index 8)
+    // Get function pointers from VTables
     void** swapChainVtable = *(void***)dummySwapChain;
+    void** contextVtable = *(void***)g_context;
+
     g_originalPresent = (Present_t)swapChainVtable[8];
+    g_originalResizeBuffers = (ResizeBuffers_t)swapChainVtable[13];
+    g_originalDrawIndexed = (DrawIndexed_t)contextVtable[12];
 
-    // Get DrawIndexed address (index 12 in ID3D11DeviceContext)
-    if (g_context) {
-        void** contextVtable = *(void***)g_context;
-        g_originalDrawIndexed = (DrawIndexed_t)contextVtable[12];
-    }
-
-    if (!g_originalPresent || !g_originalDrawIndexed) {
+    if (!g_originalPresent || !g_originalResizeBuffers || !g_originalDrawIndexed) {
         Log("[-] Failed to get function pointers");
         dummySwapChain->Release();
         return false;
     }
 
     Log("[*] Present at: 0x%p", g_originalPresent);
+    Log("[*] ResizeBuffers at: 0x%p", g_originalResizeBuffers);
     Log("[*] DrawIndexed at: 0x%p", g_originalDrawIndexed);
 
     if (MH_Initialize() != MH_OK) {
@@ -603,35 +586,23 @@ bool InstallHooks() {
         return false;
     }
 
-    // Hook Present
-    if (MH_CreateHook((void*)g_originalPresent, &HookedPresent, nullptr) != MH_OK) {
-        Log("[-] MH_CreateHook(Present) failed");
+    // Create hooks
+    if (MH_CreateHook((void*)g_originalPresent, &HookedPresent, nullptr) != MH_OK ||
+        MH_CreateHook((void*)g_originalResizeBuffers, &HookedResizeBuffers, nullptr) != MH_OK ||
+        MH_CreateHook((void*)g_originalDrawIndexed, &HookedDrawIndexed, nullptr) != MH_OK) {
+        Log("[-] MH_CreateHook failed");
         MH_Uninitialize();
         dummySwapChain->Release();
         return false;
     }
 
-    // Hook DrawIndexed
-    if (MH_CreateHook((void*)g_originalDrawIndexed, &HookedDrawIndexed, nullptr) != MH_OK) {
-        Log("[-] MH_CreateHook(DrawIndexed) failed");
+    // Enable hooks
+    if (MH_EnableHook((void*)g_originalPresent) != MH_OK ||
+        MH_EnableHook((void*)g_originalResizeBuffers) != MH_OK ||
+        MH_EnableHook((void*)g_originalDrawIndexed) != MH_OK) {
+        Log("[-] MH_EnableHook failed");
         MH_RemoveHook((void*)g_originalPresent);
-        MH_Uninitialize();
-        dummySwapChain->Release();
-        return false;
-    }
-
-    if (MH_EnableHook((void*)g_originalPresent) != MH_OK) {
-        Log("[-] MH_EnableHook(Present) failed");
-        MH_RemoveHook((void*)g_originalPresent);
-        MH_RemoveHook((void*)g_originalDrawIndexed);
-        MH_Uninitialize();
-        dummySwapChain->Release();
-        return false;
-    }
-
-    if (MH_EnableHook((void*)g_originalDrawIndexed) != MH_OK) {
-        Log("[-] MH_EnableHook(DrawIndexed) failed");
-        MH_RemoveHook((void*)g_originalPresent);
+        MH_RemoveHook((void*)g_originalResizeBuffers);
         MH_RemoveHook((void*)g_originalDrawIndexed);
         MH_Uninitialize();
         dummySwapChain->Release();
@@ -650,15 +621,18 @@ bool InstallHooks() {
 DWORD WINAPI InitThread(LPVOID) {
     Sleep(2000);
 
-#if ENABLE_CONSOLE
+    #if ENABLE_CONSOLE
     AllocConsole();
     FILE* f = nullptr;
     freopen_s(&f, "CONOUT$", "w", stdout);
-#endif
+    #endif
 
-    Log("[*] CS2 Rendering-Based Triggerbot v2.0");
-    Log("[*] Enemy Detection: DrawIndexed Hook");
-    Log("[*] Rendering: D3D11 with Index Buffers");
+    Log("[*] ============================================");
+    Log("[*] CS2 Rendering-Based Triggerbot v2.1 FINAL");
+    Log("[*] ============================================");
+    Log("[*] Detection: DrawIndexed Hook + GetStreamSource");
+    Log("[*] Rendering: D3D11 with Line Lists");
+    Log("[*] Safety: ResizeBuffers Hook + State Management");
 
     g_clientDll = GetModuleBaseAddress("client.dll");
     if (!g_clientDll) {
@@ -666,35 +640,42 @@ DWORD WINAPI InitThread(LPVOID) {
         return 0;
     }
 
-    Log("[+] client.dll: 0x%p", g_clientDll);
+    Log("[+] client.dll loaded: 0x%p", g_clientDll);
 
     if (!InstallHooks()) {
         Log("[-] Failed to install hooks");
         return 0;
     }
 
-    Log("[+] Triggerbot ACTIVE!");
-    Log("[+] Press X1 to trigger | Press DEL to unload");
+    Log("[+] ============================================");
+    Log("[+] Triggerbot is ACTIVE!");
+    Log("[+] X1 Button: Trigger");
+    Log("[+] DEL Key: Unload");
+    Log("[+] ============================================");
 
     while (g_hookInitialized) {
         if (GetAsyncKeyState(VK_DELETE) & 0x8000) {
             Log("[*] Unloading...");
             std::lock_guard<std::mutex> lock(g_mutex);
-
+            
             MH_DisableHook((void*)g_originalPresent);
+            MH_DisableHook((void*)g_originalResizeBuffers);
             MH_DisableHook((void*)g_originalDrawIndexed);
+            
             MH_RemoveHook((void*)g_originalPresent);
+            MH_RemoveHook((void*)g_originalResizeBuffers);
             MH_RemoveHook((void*)g_originalDrawIndexed);
+            
             MH_Uninitialize();
-
+            
             if (g_espVertexBuffer) g_espVertexBuffer->Release();
-            if (g_espIndexBuffer) g_espIndexBuffer->Release();
             if (g_renderTargetView) g_renderTargetView->Release();
             if (g_context) g_context->Release();
             if (g_device) g_device->Release();
-
+            
             g_hookInitialized = false;
             Log("[+] Unloaded successfully");
+            Sleep(500);
             break;
         }
         Sleep(100);
