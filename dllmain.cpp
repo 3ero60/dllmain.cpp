@@ -1,4 +1,5 @@
 #define NOMINMAX
+
 #pragma comment(lib, "libMinHook.x64.lib")
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -223,6 +224,7 @@ void DrawESPBoxes() {
         return;
     }
 
+    // Declare state pointers BEFORE the block
     ID3D11RasterizerState* oldRasterizer = nullptr;
     ID3D11BlendState* oldBlend = nullptr;
 
@@ -232,6 +234,7 @@ void DrawESPBoxes() {
     UINT sampleMask = 0xffffffff;
     g_context->OMGetBlendState(&oldBlend, blendFactor, &sampleMask);
 
+    // Setup rasterizer state
     D3D11_RASTERIZER_DESC rastDesc = {};
     rastDesc.FillMode = D3D11_FILL_SOLID;
     rastDesc.CullMode = D3D11_CULL_NONE;
@@ -243,63 +246,74 @@ void DrawESPBoxes() {
         g_context->RSSetState(rasterizer.get());
     }
 
-    D3D11_MAPPED_SUBRESOURCE mappedVB;
-    if (FAILED(g_context->Map(g_espVertexBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedVB))) {
-        if (oldRasterizer) oldRasterizer->Release();
-        if (oldBlend) oldBlend->Release();
-        return;
-    }
-
-    ESPVertex* vertices = (ESPVertex*)mappedVB.pData;
-    int vertexCount = 0;
-
-    for (auto& enemy : g_detectedEnemies) {
-        if (!enemy.visible || enemy.health <= 0) continue;
-
-        float left = enemy.screenX - enemy.boxWidth / 2;
-        float right = enemy.screenX + enemy.boxWidth / 2;
-        float top = enemy.screenY - enemy.boxHeight;
-        float bottom = enemy.screenY;
-
-        unsigned int boxColor = (enemy.teamNum != g_localPlayerTeam) ? 0xFF0000FF : 0xFF00FF00;
-        unsigned int healthColor = 0xFF00FF00;
-
-        if (vertexCount + 8 <= MAX_ESP_VERTICES) {
-            vertices[vertexCount++] = { left, top, 0.5f, boxColor };
-            vertices[vertexCount++] = { right, top, 0.5f, boxColor };
-
-            vertices[vertexCount++] = { right, top, 0.5f, boxColor };
-            vertices[vertexCount++] = { right, bottom, 0.5f, boxColor };
-
-            vertices[vertexCount++] = { right, bottom, 0.5f, boxColor };
-            vertices[vertexCount++] = { left, bottom, 0.5f, boxColor };
-
-            vertices[vertexCount++] = { left, bottom, 0.5f, boxColor };
-            vertices[vertexCount++] = { left, top, 0.5f, boxColor };
+    // BLOCK 1: Map and draw
+    {
+        D3D11_MAPPED_SUBRESOURCE mappedVB;
+        if (FAILED(g_context->Map(g_espVertexBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedVB))) {
+            if (oldRasterizer) oldRasterizer->Release();
+            if (oldBlend) oldBlend->Release();
+            return;
         }
 
-        if (vertexCount + 2 <= MAX_ESP_VERTICES) {
-            float healthPercent = std::max(0.0f, std::min(1.0f, enemy.health / 100.0f));
-            float healthBarTop = top + (enemy.boxHeight * (1.0f - healthPercent));
+        // Variables declared INSIDE this block
+        ESPVertex* vertices = (ESPVertex*)mappedVB.pData;
+        int vertexCount = 0;
 
-            vertices[vertexCount++] = { left - 8, top, 0.5f, healthColor };
-            vertices[vertexCount++] = { left - 8, healthBarTop, 0.5f, healthColor };
+        // Generate box vertices for each enemy
+        for (auto& enemy : g_detectedEnemies) {
+            if (!enemy.visible || enemy.health <= 0) continue;
+
+            float left = enemy.screenX - enemy.boxWidth / 2;
+            float right = enemy.screenX + enemy.boxWidth / 2;
+            float top = enemy.screenY - enemy.boxHeight;
+            float bottom = enemy.screenY;
+
+            unsigned int boxColor = (enemy.teamNum != g_localPlayerTeam) ? 0xFF0000FF : 0xFF00FF00;
+            unsigned int healthColor = 0xFF00FF00;
+
+            // Box outline (8 vertices for 4 lines with LINELIST)
+            if (vertexCount + 8 <= MAX_ESP_VERTICES) {
+                vertices[vertexCount++] = { left, top, 0.5f, boxColor };
+                vertices[vertexCount++] = { right, top, 0.5f, boxColor };
+
+                vertices[vertexCount++] = { right, top, 0.5f, boxColor };
+                vertices[vertexCount++] = { right, bottom, 0.5f, boxColor };
+
+                vertices[vertexCount++] = { right, bottom, 0.5f, boxColor };
+                vertices[vertexCount++] = { left, bottom, 0.5f, boxColor };
+
+                vertices[vertexCount++] = { left, bottom, 0.5f, boxColor };
+                vertices[vertexCount++] = { left, top, 0.5f, boxColor };
+            }
+
+            // Health bar (left side)
+            if (vertexCount + 2 <= MAX_ESP_VERTICES) {
+                float healthPercent = (enemy.health < 0) ? 0.0f : (enemy.health > 100) ? 1.0f : (enemy.health / 100.0f);
+                float healthBarTop = top + (enemy.boxHeight * (1.0f - healthPercent));
+
+                vertices[vertexCount++] = { left - 8, top, 0.5f, healthColor };
+                vertices[vertexCount++] = { left - 8, healthBarTop, 0.5f, healthColor };
+            }
+        }
+
+        g_context->Unmap(g_espVertexBuffer, 0);
+
+        // BLOCK 2: Setup and draw (vertexCount still in scope)
+        {
+            UINT stride = sizeof(ESPVertex), offset = 0;
+            g_context->IASetVertexBuffers(0, 1, &g_espVertexBuffer, &stride, &offset);
+            g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
+            g_context->Draw(vertexCount, 0);
         }
     }
 
-    g_context->Unmap(g_espVertexBuffer, 0);
-
-    UINT stride = sizeof(ESPVertex), offset = 0;
-    g_context->IASetVertexBuffers(0, 1, &g_espVertexBuffer, &stride, &offset);
-    g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
-    g_context->Draw(vertexCount, 0);
-
+    // Cleanup (outside all blocks where it's safe)
     if (oldRasterizer) {
         g_context->RSSetState(oldRasterizer);
         oldRasterizer->Release();
     }
     if (oldBlend) {
-        g_context->OMSetBlendState(oldBlend, blendFactor, sampleMask);
+        g_context->OMSetBlendState(oldBlend, blendFactor, &sampleMask);
         oldBlend->Release();
     }
 }
@@ -693,7 +707,7 @@ DWORD WINAPI InitThread(LPVOID) {
     Log("║ Delay Range      : 85-120ms (human-like)            ║");
     Log("║ Crosshair Tol.   : 80px radius                      ║");
     Log("║ Team Filtering   : Enabled (no friendly fire)       ║");
-    Log("╚═════════════════════��════════════════════════════════╝");
+    Log("╚══════════════════════════════════════════════════════╝");
     Log("");
 
     while (g_hookInitialized && !g_unloading) {
