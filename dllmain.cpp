@@ -543,6 +543,11 @@ HRESULT __stdcall HookedResizeBuffers(IDXGISwapChain* pThis, UINT BufferCount, U
 
     Log("[*] Window resize detected: %dx%d", Width, Height);
 
+    // Stelle sicher, dass keine Ressourcen gebunden sind
+    if (g_context) {
+        g_context->ClearState();
+    }
+
     // Release render target before resize
     if (g_renderTargetView) {
         g_renderTargetView->Release();
